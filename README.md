@@ -53,3 +53,12 @@ schtasks /Delete /TN "Streetwear Yeni Urun Takibi" /F
 `magazalar.json` içindeki mevcut mağaza adresleri erişilebilir mağaza sayfaları olarak doğrulandı; yeni, tahmini adres eklenmedi. Bir mağazayı kapatmak için ilgili kayda `"enabled": false` ekleyin. `waiting_for_url` listesi otomatik taranmaz.
 
 Tarama yöntemi `auto` iken önce Shopify ürün listesi, ardından güvenilir ürün URL deseni kullanan sitemap denenir. Genel derin sitemap bağlantıları artık ürün kabul edilmez; bu özellikle yanlış pozitifleri azaltır.
+
+## V4 event ve teslimat yaşam döngüsü
+
+- State şeması `schema_version: 4` olarak sürümlenir. V3 ve daha eski kayıtlar ilk V4 taramasında sessiz temel kayda alınır: önceki ürün, stok ve fiyat bilgileri korunur; geçmiş için yeni ürün/restock bildirimi üretilmez.
+- Her mağaza için `known_products` geçmişte görülen ürünleri, `current_products` ise son güvenilir katalogyu tutar. Katalogdan kaybolup aynı Shopify product ID ile geri dönen ürün `PRODUCT_RETURNED` olur; yeniden `NEW_PRODUCT` sayılmaz. Bilinen ürünler mağaza başına sınırlı tutulur; aktif katalog ürünleri evict edilmez.
+- Stok geçişleri state'te bir occurrence generation sayacı taşır. Böylece aynı tarama tekrar işlendiğinde duplicate oluşmaz; fakat `False → True → False → True` gerçek hayat döngüsündeki ikinci restock yeni bir olaydır.
+- `event_history` gerçekleşen olayların son 1000 kaydını tutar. `delivery_queue` yalnızca olayın oluştuğu andaki Telegram politikasından geçen kayıtları taşır. Filtre nedeniyle atlanan eski olaylar ayar değişince sonradan toplu gönderilmez.
+- Telegram teslimatı sekizerli batch'ler halinde yapılır. Başarılı her batch atomik olarak delivered işaretlenir ve kuyruktan çıkarılır; sonraki batch başarısız olursa yalnızca teslim edilmemiş batch'ler yeniden denenir. Gönderim isteği başarıya dönmeden önce uygulama veya ağ kesilirse Telegram'ın isteği gerçekten alıp almadığı dışarıdan kesin olarak bilinemeyebilir.
+- Para biriminde önce mağaza yapılandırmasındaki `currency`, sonra Shopify yanıtındaki açık currency alanı kullanılır. Güvenilir değer yoksa `UNKNOWN` gösterilir; TRY varsayılmaz.

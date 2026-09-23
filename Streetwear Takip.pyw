@@ -125,7 +125,7 @@ class App(tk.Tk):
             self.stores.insert("", "end", iid=name, values=(name, record.get("count", "—"), record.get("checked", "Henüz taranmadı"), status))
             self.store_urls[name] = site.get("url", "")
         self.pending_urls = {}
-        for index, item in enumerate(state["pending"]):
+        for index, item in enumerate(state.get("delivery_queue", [])):
             if not isinstance(item, dict):
                 continue
             price = monitor.money(item.get("new_price", item.get("price")), item.get("currency")) if "new_price" in item or "price" in item else "—"
