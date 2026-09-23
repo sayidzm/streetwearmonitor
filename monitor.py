@@ -1,50 +1,42 @@
 #!/usr/bin/env python3
-"""Streetwear yeni ürün ve fiyat düşüşü takipçisi (Python 3.10+, bağımlılıksız)."""
+"""Streetwear Monitor: kimlik, envanter ve idempotent olay katmanı."""
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import gzip
+import hashlib
 import html
 import json
 import os
 from pathlib import Path
-import re
 import sys
 import tempfile
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
-import xml.etree.ElementTree as ET
+
+from scanners import ShopifyScanner, SitemapScanner
+from scanners.base import normalize, price_value
+from scanners.sitemap import title_from_url
 
 ROOT = Path(__file__).resolve().parent
 CONFIG, STATE = ROOT / "magazalar.json", ROOT / "veri.json"
 SETTINGS, FAVORITES = ROOT / "ayarlar.json", ROOT / "favoriler.json"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StreetwearTakip/2.0; +local-personal-use)"}
-PRODUCT_PATHS = re.compile(r"/(?:products?|urun(?:ler)?|p)/[^/?#]+", re.I)
-SKIP_PATHS = re.compile(r"/(?:collections?|categories?|kategori|blog|pages?|search|cart|account|tags?)/", re.I)
-STATE_VERSION = 2
+STATE_VERSION = 3
+EVENT_HISTORY_LIMIT = 1000
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "telegram": {"notify_new": True, "notify_price_drops": True, "only_favorites": False,
-                 "brands": [], "include_keywords": [], "exclude_keywords": [], "minimum_discount_percent": 0},
+    "telegram": {
+        "notify_new": True, "notify_price_drops": True, "notify_stock": True,
+        "notify_price_increases": False, "only_favorites": False, "brands": [],
+        "include_keywords": [], "exclude_keywords": [], "minimum_discount_percent": 0,
+    },
     "scan": {"max_workers": 4, "max_products_per_store": 15000, "minimum_catalog_ratio": 0.25},
 }
 
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def fetch(url: str, limit: int = 8_000_000) -> bytes:
-    with urlopen(Request(url, headers=HEADERS), timeout=25) as response:
-        data = response.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError("Yanıt çok büyük")
-        if response.headers.get("Content-Encoding", "").lower() == "gzip" or url.endswith(".gz"):
-            data = gzip.decompress(data)
-        return data
 
 
 def atomic_json(path: Path, value: Any) -> None:
@@ -78,129 +70,140 @@ def merge_defaults(value: Any, defaults: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def normalize(url: str) -> str:
-    parsed = urlparse(url.strip())
-    path = re.sub(r"/+", "/", parsed.path).rstrip("/") or "/"
-    return urlunparse((parsed.scheme.lower() or "https", parsed.netloc.lower(), path, "", "", ""))
+def digest(*parts: Any) -> str:
+    return hashlib.sha256("\x1f".join(str(part) for part in parts).encode("utf-8")).hexdigest()[:24]
 
 
-def same_host(url: str, base: str) -> bool:
-    return (urlparse(url).hostname or "").removeprefix("www.").lower() == (urlparse(base).hostname or "").removeprefix("www.").lower()
+def stable_store_id(site: dict[str, Any]) -> str:
+    return str(site.get("id") or f"store_{digest(normalize(str(site['url'])))}")
 
 
-def title_from_url(url: str) -> str:
-    slug = urlparse(url).path.rstrip("/").split("/")[-1]
-    return re.sub(r"[-_]", " ", slug).strip().title() or "İsimsiz ürün"
+def ensure_store_ids(config: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    changed = False
+    for site in config.get("sites", []) if isinstance(config.get("sites"), list) else []:
+        if isinstance(site, dict) and site.get("url") and not site.get("id"):
+            site["id"] = stable_store_id(site)
+            changed = True
+    return config, changed
 
 
-def price_value(raw: Any) -> float | None:
-    try:
-        value = float(str(raw).replace(",", "."))
-        return value if value >= 0 else None
-    except (TypeError, ValueError):
+def legacy_product(raw: Any, key: str) -> dict[str, Any] | None:
+    item = dict(raw) if isinstance(raw, dict) else {}
+    url = item.get("url") or key
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return None
+    url = normalize(url)
+    product_id = str(item.get("id") or f"url:{url}")
+    variants = item.get("variants") if isinstance(item.get("variants"), dict) else {}
+    return {
+        "id": product_id, "name": str(item.get("name") or title_from_url(url)), "url": url,
+        "image": item.get("image"), "price": price_value(item.get("price")),
+        "compare_at_price": price_value(item.get("compare_at_price")), "currency": item.get("currency"),
+        "available": item.get("available"), "variants": variants,
+    }
 
 
-def product(name: str, url: str, price: Any = None, compare_at_price: Any = None) -> dict[str, Any]:
-    item: dict[str, Any] = {"name": str(name or title_from_url(url)).strip()[:300], "url": normalize(url)}
-    current, old = price_value(price), price_value(compare_at_price)
-    if current is not None:
-        item["price"] = current
-    if current is not None and old is not None and old > current:
-        item["compare_at_price"] = old
-    return item
-
-
-def shopify(base: str) -> dict[str, dict[str, Any]]:
-    found: dict[str, dict[str, Any]] = {}
-    for page in range(1, 31):
-        payload = json.loads(fetch(urljoin(base.rstrip("/") + "/", f"products.json?limit=250&page={page}")))
-        products = payload.get("products") if isinstance(payload, dict) else None
-        if not isinstance(products, list):
-            raise ValueError("Shopify ürün yanıtı geçerli değil")
-        for item in products:
-            if not isinstance(item, dict) or not item.get("handle"):
-                continue
-            url = urljoin(base.rstrip("/") + "/", "products/" + quote(str(item["handle"]), safe="-"))
-            variants = item.get("variants") if isinstance(item.get("variants"), list) else []
-            prices = [price_value(v.get("price")) for v in variants if isinstance(v, dict)]
-            compares = [price_value(v.get("compare_at_price")) for v in variants if isinstance(v, dict)]
-            found[normalize(url)] = product(item.get("title", ""), url, min((p for p in prices if p is not None), default=None), min((p for p in compares if p is not None), default=None))
-        if len(products) < 250:
-            return found
-    raise ValueError("Shopify sayfa sınırı aşıldı; eksik katalog kaydedilmedi")
-
-
-def sitemap(base: str) -> dict[str, dict[str, Any]]:
-    queue, visited, found = [urljoin(base.rstrip("/") + "/", "sitemap.xml")], set(), {}
-    while queue:
-        if len(visited) >= 80:
-            raise ValueError("Sitemap sınırı aşıldı; eksik katalog kaydedilmedi")
-        url = queue.pop(0)
-        if url in visited or not same_host(url, base):
-            continue
-        visited.add(url)
-        root = ET.fromstring(fetch(url))
-        if root.tag.endswith("sitemapindex"):
-            for loc in root.findall(".//{*}sitemap/{*}loc"):
-                link = (loc.text or "").strip()
-                if link and same_host(link, base) and not re.search(r"(blog|article|page|category|collection|image)", link, re.I):
-                    queue.append(link)
-            continue
-        for loc in root.findall(".//{*}url/{*}loc"):
-            link = (loc.text or "").strip()
-            path = urlparse(link).path
-            if not link or not same_host(link, base) or SKIP_PATHS.search(path) or not PRODUCT_PATHS.search(path):
-                continue
-            link = normalize(link)
-            found[link] = product(title_from_url(link), link)
-    if not found:
-        raise ValueError("Sitemap içinde güvenilir ürün bağlantısı yok")
-    return found
+def migrate_state(raw: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    config = config or {"sites": []}
+    by_name = {str(site.get("name")): stable_store_id(site) for site in config.get("sites", []) if isinstance(site, dict) and site.get("url")}
+    stores: dict[str, dict[str, Any]] = {}
+    for old_key, record in (raw.get("stores", {}) if isinstance(raw.get("stores"), dict) else {}).items():
+        record = record if isinstance(record, dict) else {}
+        store_id = old_key if str(old_key).startswith("store_") else by_name.get(str(old_key), f"legacy_{digest(old_key)}")
+        products_raw = record.get("products") if isinstance(record.get("products"), dict) else {url: {"url": url} for url in record.get("seen", []) if isinstance(url, str)}
+        products = {}
+        for key, item in products_raw.items():
+            converted = legacy_product(item, str(key))
+            if converted:
+                products[converted["id"]] = converted
+        previous = stores.get(store_id, {})
+        previous["products"] = {**previous.get("products", {}), **products}
+        previous.update({
+            "id": store_id, "name": record.get("name") or old_key, "url": record.get("url"),
+            "count": int(record.get("count", len(previous["products"]))), "checked": record.get("checked", "-"),
+            "last_error": record.get("last_error"),
+            "baseline_pending": True if raw.get("version") != STATE_VERSION else bool(record.get("baseline_pending", False)),
+        })
+        stores[store_id] = previous
+    pending = []
+    for item in raw.get("pending", []) if isinstance(raw.get("pending"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("url"), str):
+            event = dict(item)
+            event.setdefault("type", event.pop("kind", "NEW_PRODUCT").upper())
+            event.setdefault("id", "legacy_" + digest(event["type"], event.get("brand", ""), event["url"]))
+            pending.append(event)
+    history = raw.get("event_history", []) if isinstance(raw.get("event_history"), list) else []
+    history_ids = {item.get("id") for item in history if isinstance(item, dict)} | set(raw.get("sent", {}).keys() if isinstance(raw.get("sent"), dict) else [])
+    return {"version": STATE_VERSION, "stores": stores, "pending": pending,
+            "event_history": history[-EVENT_HISTORY_LIMIT:], "event_ids": sorted(item for item in history_ids if isinstance(item, str))[-EVENT_HISTORY_LIMIT:]}
 
 
 def scan(site: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    base, method = site["url"], site.get("method", "auto")
+    method = site.get("method", "auto")
     if method not in {"auto", "shopify", "sitemap"}:
         raise ValueError("Bilinmeyen tarama yöntemi")
     if method in {"auto", "shopify"}:
         try:
-            result = shopify(base)
-            if result:
-                return result
+            found = ShopifyScanner().scan(site)
+            if found:
+                return found
             raise ValueError("Shopify ürün listesi boş")
         except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError):
             if method == "shopify":
                 raise
-    return sitemap(base)
+    return SitemapScanner().scan(site)
 
 
-def migrate_state(raw: Any) -> dict[str, Any]:
-    raw = raw if isinstance(raw, dict) else {}
-    stores: dict[str, Any] = {}
-    old_stores = raw.get("stores", {}) if isinstance(raw.get("stores"), dict) else {}
-    for name, old in old_stores.items():
-        old = old if isinstance(old, dict) else {}
-        products = old.get("products") if isinstance(old.get("products"), dict) else {}
-        if not products:
-            products = {normalize(url): product(title_from_url(url), url) for url in old.get("seen", []) if isinstance(url, str)}
-        stores[name] = {"products": products, "count": int(old.get("count", len(products))), "checked": old.get("checked", "-"), "last_error": old.get("last_error"),
-                        "baseline_pending": old.get("baseline_pending", raw.get("version") != STATE_VERSION)}
-    # URL-only v1 records cannot reliably be compared with richer v2 product records.
-    # The first v2 scan is therefore a silent baseline, never a notification flood.
-    pending: list[dict[str, Any]] = []
-    for item in raw.get("pending", []) if isinstance(raw.get("pending"), list) else []:
-        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+def product_match(current: dict[str, Any], old_products: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    if current["id"] in old_products:
+        return old_products[current["id"]]
+    url = normalize(current["url"])
+    return next((old for old in old_products.values() if isinstance(old, dict) and old.get("url") and normalize(str(old["url"])) == url), None)
+
+
+def event_id(event_type: str, store_id: str, product_id: str, variant_id: str | None = None, before: Any = None, after: Any = None) -> str:
+    return "evt_" + digest(event_type, store_id, product_id, variant_id or "", before if before is not None else "", after if after is not None else "")
+
+
+def event(event_type: str, store: dict[str, Any], product: dict[str, Any], *, variant: dict[str, Any] | None = None, before: Any = None, after: Any = None) -> dict[str, Any]:
+    old_price, new_price = (before, after) if event_type in {"PRICE_DROP", "PRICE_INCREASE"} else (None, None)
+    data = {
+        "type": event_type, "store_id": store["id"], "store_name": store["name"], "product_id": product["id"],
+        "product_name": product["name"], "url": product["url"], "image": product.get("image"), "currency": product.get("currency"),
+        "variant_id": variant.get("id") if variant else None, "variant_title": variant.get("title") if variant else None,
+        "old_price": old_price, "new_price": new_price, "before": before, "after": after,
+    }
+    if old_price not in (None, 0) and new_price is not None:
+        data["change_percent"] = round((new_price - old_price) / old_price * 100, 2)
+    data["id"] = event_id(event_type, data["store_id"], data["product_id"], data["variant_id"], before, after)
+    return data
+
+
+def compare_products(store: dict[str, Any], current: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for item in current.values():
+        old = product_match(item, previous)
+        if old is None:
+            events.append(event("NEW_PRODUCT", store, item))
             continue
-        item = dict(item)
-        item.setdefault("kind", "new")
-        item.setdefault("name", title_from_url(item["url"]))
-        item.setdefault("brand", "Bilinmeyen mağaza")
-        item.setdefault("id", event_id(item["kind"], item["brand"], item))
-        pending.append(item)
-    return {"version": STATE_VERSION, "_legacy": raw.get("version") != STATE_VERSION, "stores": stores,
-            "pending": pending,
-            "sent": raw.get("sent", {}) if isinstance(raw.get("sent"), dict) else {}}
+        if old.get("available") is False and item.get("available") is True:
+            events.append(event("RESTOCK", store, item, before=False, after=True))
+        if old.get("available") is True and item.get("available") is False:
+            events.append(event("SOLD_OUT", store, item, before=True, after=False))
+        old_price, new_price = price_value(old.get("price")), price_value(item.get("price"))
+        if old_price is not None and new_price is not None and old_price != new_price:
+            events.append(event("PRICE_DROP" if new_price < old_price else "PRICE_INCREASE", store, item, before=old_price, after=new_price))
+        old_variants = old.get("variants") if isinstance(old.get("variants"), dict) else {}
+        for variant_id, variant in (item.get("variants") or {}).items():
+            prior = old_variants.get(variant_id)
+            if not isinstance(prior, dict):
+                continue
+            if prior.get("available") is False and variant.get("available") is True:
+                events.append(event("VARIANT_RESTOCK", store, item, variant=variant, before=False, after=True))
+            if prior.get("available") is True and variant.get("available") is False:
+                events.append(event("VARIANT_SOLD_OUT", store, item, variant=variant, before=True, after=False))
+    return events
 
 
 def favorite_urls() -> set[str]:
@@ -209,50 +212,29 @@ def favorite_urls() -> set[str]:
     return {normalize(item["url"] if isinstance(item, dict) else item) for item in values if isinstance(item, str) or isinstance(item, dict) and isinstance(item.get("url"), str)}
 
 
-def event_id(kind: str, brand: str, item: dict[str, Any], old_price: float | None = None) -> str:
-    suffix = f":{old_price:.2f}->{item.get('price'):.2f}" if kind == "price_drop" and old_price is not None and isinstance(item.get("price"), (int, float)) else ""
-    return f"{kind}:{brand}:{item['url']}{suffix}"
-
-
-def make_events(brand: str, current: dict[str, dict[str, Any]], previous: dict[str, dict[str, Any]], sent: dict[str, str]) -> list[dict[str, Any]]:
-    events = []
-    for url, item in current.items():
-        old = previous.get(url)
-        if old is None:
-            kind, old_price = "new", None
-        else:
-            old_price, new_price = price_value(old.get("price")), price_value(item.get("price"))
-            if old_price is None or new_price is None or new_price >= old_price:
-                continue
-            kind = "price_drop"
-        identity = event_id(kind, brand, item, old_price)
-        if identity not in sent:
-            event = {"id": identity, "kind": kind, "brand": brand, **item}
-            if old_price is not None:
-                event["old_price"] = old_price
-            events.append(event)
-    return events
-
-
-def allowed(event: dict[str, Any], settings: dict[str, Any], favorites: set[str]) -> bool:
-    rules = settings["telegram"]
-    if event["kind"] == "new" and not rules["notify_new"] or event["kind"] == "price_drop" and not rules["notify_price_drops"]:
+def allowed(item: dict[str, Any], settings: dict[str, Any], favorites: set[str]) -> bool:
+    rules, event_type = settings["telegram"], item.get("type", "NEW_PRODUCT")
+    if event_type == "NEW_PRODUCT" and not rules["notify_new"] or event_type == "PRICE_DROP" and not rules["notify_price_drops"]:
         return False
-    if rules["only_favorites"] and normalize(event["url"]) not in favorites:
+    if event_type in {"RESTOCK", "SOLD_OUT", "VARIANT_RESTOCK", "VARIANT_SOLD_OUT"} and not rules.get("notify_stock", True):
+        return False
+    if event_type == "PRICE_INCREASE" and not rules.get("notify_price_increases", False):
+        return False
+    if rules["only_favorites"] and normalize(item["url"]) not in favorites:
         return False
     brands = {str(value).casefold() for value in rules.get("brands", [])}
-    if brands and event["brand"].casefold() not in brands:
+    if brands and item.get("store_name", item.get("brand", "")).casefold() not in brands:
         return False
-    text = f"{event['brand']} {event['name']}".casefold()
+    text = f"{item.get('store_name', item.get('brand', ''))} {item.get('product_name', item.get('name', ''))}".casefold()
     include = [str(value).casefold() for value in rules.get("include_keywords", []) if str(value).strip()]
     exclude = [str(value).casefold() for value in rules.get("exclude_keywords", []) if str(value).strip()]
     if include and not any(value in text for value in include) or any(value in text for value in exclude):
         return False
-    return not (event["kind"] == "price_drop" and event.get("old_price") and (1 - event["price"] / event["old_price"]) * 100 < float(rules.get("minimum_discount_percent", 0)))
+    return not (event_type == "PRICE_DROP" and item.get("change_percent", 0) > -float(rules.get("minimum_discount_percent", 0)))
 
 
-def money(value: Any) -> str:
-    return f"₺{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def money(value: Any, currency: str | None) -> str:
+    return f"{value:,.2f} {currency or ''}".strip() if isinstance(value, (int, float)) else "—"
 
 
 def telegram(items: list[dict[str, Any]]) -> bool:
@@ -260,10 +242,12 @@ def telegram(items: list[dict[str, Any]]) -> bool:
     if not token or not chat_id:
         return False
     for offset in range(0, len(items), 8):
-        lines = ["🔔 Streetwear Takip"]
+        lines = ["Streetwear Takip"]
         for item in items[offset:offset + 8]:
-            details = f" — {money(item['old_price'])} → {money(item['price'])}" if item["kind"] == "price_drop" else ""
-            lines.append(f"{'🆕' if item['kind'] == 'new' else '💸'} {html.escape(item['brand'])}: <a href=\"{html.escape(item['url'], quote=True)}\">{html.escape(item['name'][:110])}</a>{details}")
+            price = ""
+            if item.get("type") in {"PRICE_DROP", "PRICE_INCREASE"}:
+                price = f" — {money(item.get('old_price'), item.get('currency'))} → {money(item.get('new_price'), item.get('currency'))}"
+            lines.append(f"• {html.escape(item.get('type', 'EVENT'))} | {html.escape(item.get('store_name', item.get('brand', '')))}: <a href=\"{html.escape(item['url'], quote=True)}\">{html.escape(item.get('product_name', item.get('name', ''))[:110])}</a>{price}")
         payload = json.dumps({"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML", "disable_web_page_preview": True}).encode()
         result = json.loads(urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=payload, headers={"Content-Type": "application/json"}), timeout=25).read())
         if not result.get("ok"):
@@ -271,21 +255,32 @@ def telegram(items: list[dict[str, Any]]) -> bool:
     return True
 
 
+def queue_events(state: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    known = set(state.get("event_ids", [])) | {item.get("id") for item in state.get("pending", []) if isinstance(item, dict)}
+    fresh = [item for item in events if item["id"] not in known]
+    state["pending"].extend(fresh)
+    history = state.get("event_history", []) + fresh
+    state["event_history"] = history[-EVENT_HISTORY_LIMIT:]
+    state["event_ids"] = [item["id"] for item in state["event_history"]][-EVENT_HISTORY_LIMIT:]
+
+
 def check(args: argparse.Namespace) -> int:
     config = load_json(CONFIG, {})
     if not isinstance(config.get("sites"), list):
         raise ValueError("magazalar.json içindeki sites bir liste olmalı")
-    settings, state = merge_defaults(load_json(SETTINGS, {}), DEFAULT_SETTINGS), migrate_state(load_json(STATE, {}))
-    legacy_baseline = state.pop("_legacy", False)
+    config, config_changed = ensure_store_ids(config)
+    if config_changed:
+        atomic_json(CONFIG, config)
+    settings, state = merge_defaults(load_json(SETTINGS, {}), DEFAULT_SETTINGS), migrate_state(load_json(STATE, {}), config)
     sites = [site for site in config["sites"] if isinstance(site, dict) and site.get("enabled", True)]
     if args.status:
-        print(f"Etkin site: {len(sites)} | Adresi beklenen: {len(config.get('waiting_for_url', []))} | Bekleyen bildirim: {len(state['pending'])}")
+        print(f"Etkin site: {len(sites)} | Bekleyen bildirim: {len(state['pending'])}")
         for site in sites:
-            record = state["stores"].get(site.get("name"), {})
+            record = state["stores"].get(stable_store_id(site), {})
             print(f"{site.get('name', '?')}: {record.get('count', 'henüz taranmadı')} ürün, {record.get('checked', '-')}")
         return 0
     if args.test_bildirim:
-        if not telegram([{"kind": "new", "brand": "Test", "name": "Bildirim bağlantısı çalışıyor", "url": "https://example.com"}]):
+        if not telegram([{"type": "TEST", "store_name": "Test", "product_name": "Bildirim bağlantısı çalışıyor", "url": "https://example.com"}]):
             print("Önce STREETWEAR_BOT_TOKEN ve STREETWEAR_CHAT_ID ayarla")
             return 2
         print("Test bildirimi gönderildi")
@@ -295,26 +290,27 @@ def check(args: argparse.Namespace) -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, int(settings["scan"].get("max_workers", 4))))) as pool:
         jobs = {pool.submit(scan, site): site for site in sites}
         for future in concurrent.futures.as_completed(jobs):
-            site, name = jobs[future], jobs[future].get("name", "Adsız mağaza")
+            site, store_id = jobs[future], stable_store_id(jobs[future])
+            name = site.get("name", "Adsız mağaza")
             try:
-                current, old_record = future.result(), state["stores"].get(name)
+                current, old_record = future.result(), state["stores"].get(store_id)
                 if len(current) > int(site.get("max_products", max_products)):
                     raise ValueError(f"Katalog güvenlik sınırını aştı ({len(current)} ürün)")
                 previous = old_record.get("products", {}) if old_record else {}
                 if previous and len(current) < max(1, int(old_record.get("count", len(previous)) * ratio)):
                     raise ValueError("Ürün sayısı şüpheli biçimde azaldı; önceki kayıt korundu")
-                is_baseline = legacy_baseline or bool(old_record and old_record.get("baseline_pending"))
-                events = make_events(name, current, previous, state["sent"]) if old_record and not is_baseline else []
+                store = {"id": store_id, "name": name, "url": site["url"]}
+                is_baseline = not old_record or bool(old_record.get("baseline_pending"))
+                events = [] if is_baseline else compare_products(store, current, previous)
                 discovered.extend(events)
-                state["stores"][name] = {"products": current, "count": len(current), "checked": now(), "last_error": None, "baseline_pending": False}
+                state["stores"][store_id] = {**store, "products": current, "count": len(current), "checked": now(), "last_error": None, "baseline_pending": False}
                 print(f"{name}: {len(current)} ürün, {len(events)} yeni olay" if old_record else f"{name}: ilk güvenilir tarama, {len(current)} ürün kaydedildi")
             except Exception as error:
                 failures.append(name)
-                record = state["stores"].setdefault(name, {"products": {}, "count": 0, "checked": "-", "baseline_pending": legacy_baseline})
+                record = state["stores"].setdefault(store_id, {"id": store_id, "name": name, "url": site["url"], "products": {}, "count": 0, "checked": "-", "baseline_pending": True})
                 record["last_error"] = f"{now()}: {error}"
                 print(f"{name}: HATA: {error}", file=sys.stderr)
-    queued = {item.get("id") for item in state["pending"] if isinstance(item, dict)}
-    state["pending"].extend(item for item in discovered if item["id"] not in queued)
+    queue_events(state, discovered)
     to_send = [item for item in state["pending"] if isinstance(item, dict) and allowed(item, settings, favorite_urls())]
     if args.dry_run:
         print(f"Kuru çalışma: {len(to_send)} Telegram bildirimi gönderilmeden listelendi.")
@@ -323,7 +319,6 @@ def check(args: argparse.Namespace) -> int:
             if telegram(to_send):
                 sent_ids = {item["id"] for item in to_send}
                 state["pending"] = [item for item in state["pending"] if item.get("id") not in sent_ids]
-                state["sent"].update({item_id: now() for item_id in sent_ids})
                 print(f"{len(sent_ids)} olay Telegram ile bildirildi")
             else:
                 print(f"{len(to_send)} olay bulundu. Telegram ayarlanmadı; bildirim beklemede.")
@@ -339,10 +334,10 @@ def check(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Yeni streetwear ürünlerini ve fiyat düşüşlerini kontrol et")
-    parser.add_argument("--status", action="store_true", help="Mağazalar, son tarama ve bekleyen bildirimler")
-    parser.add_argument("--test-bildirim", action="store_true", help="Telegram bağlantısını dene")
-    parser.add_argument("--dry-run", action="store_true", help="Tarar, Telegram'a göndermez")
+    parser = argparse.ArgumentParser(description="Streetwear ürün, stok ve fiyat olaylarını kontrol et")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--test-bildirim", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return check(parser.parse_args())
 
 

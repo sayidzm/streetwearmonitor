@@ -108,7 +108,7 @@ class App(tk.Tk):
     def refresh(self) -> None:
         try:
             config = monitor.load_json(monitor.CONFIG, {})
-            state = monitor.migrate_state(monitor.load_json(monitor.STATE, {}))
+            state = monitor.migrate_state(monitor.load_json(monitor.STATE, {}), config)
             settings = monitor.merge_defaults(monitor.load_json(monitor.SETTINGS, {}), monitor.DEFAULT_SETTINGS)
         except ValueError as error:
             messagebox.showerror("Dosya hatası", str(error))
@@ -119,7 +119,7 @@ class App(tk.Tk):
         for site in config.get("sites", []):
             if not site.get("enabled", True):
                 continue
-            name, record = site.get("name", "Adsız"), state["stores"].get(site.get("name"), {})
+            name, record = site.get("name", "Adsız"), state["stores"].get(monitor.stable_store_id(site), {})
             problem = record.get("last_error")
             status = problem or "Hazır"
             self.stores.insert("", "end", iid=name, values=(name, record.get("count", "—"), record.get("checked", "Henüz taranmadı"), status))
@@ -128,10 +128,10 @@ class App(tk.Tk):
         for index, item in enumerate(state["pending"]):
             if not isinstance(item, dict):
                 continue
-            price = monitor.money(item["price"]) if "price" in item else "—"
-            kind = "Yeni ürün" if item.get("kind") == "new" else "Fiyat düştü"
+            price = monitor.money(item.get("new_price", item.get("price")), item.get("currency")) if "new_price" in item or "price" in item else "—"
+            kind = item.get("type", "NEW_PRODUCT")
             iid = f"pending-{index}"
-            self.pending.insert("", "end", iid=iid, values=(kind, item.get("brand", ""), item.get("name", ""), price))
+            self.pending.insert("", "end", iid=iid, values=(kind, item.get("store_name", item.get("brand", "")), item.get("product_name", item.get("name", "")), price))
             self.pending_urls[iid] = item.get("url", "")
         rules = settings["telegram"]
         self.new_var.set(rules["notify_new"]); self.drop_var.set(rules["notify_price_drops"]); self.fav_var.set(rules["only_favorites"])
