@@ -1,0 +1,16 @@
+{
+  "telegram": {
+    "notify_new": true,
+    "notify_price_drops": true,
+    "only_favorites": false,
+    "brands": [],
+    "include_keywords": [],
+    "exclude_keywords": [],
+    "minimum_discount_percent": 0
+  },
+  "scan": {
+    "max_workers": 4,
+    "max_products_per_store": 15000,
+    "minimum_catalog_ratio": 0.25
+  }
+}

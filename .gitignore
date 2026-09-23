@@ -1,0 +1,7 @@
+# Kullanıcı verileri ve çalışma günlükleri GitHub'a gönderilmez.
+veri.json
+ayarlar.json
+favoriler.json
+takvim.log
+__pycache__/
+*.pyc
